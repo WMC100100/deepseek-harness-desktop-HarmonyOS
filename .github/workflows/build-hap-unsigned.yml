@@ -1,0 +1,399 @@
+# 一次性构建 HDSH 完整 HAP（未签名）
+#
+# 放到仓库 .github/workflows/build-hap-unsigned.yml
+# Actions → build-hap-unsigned → Run workflow
+#
+# 两个 job：
+#   1) libnode：交叉编译 libnode.so.127（arm64）
+#   2) hap：DevEco Linux CLT + 补 5 样运行期产物 + 编 unsigned HAP
+#
+# 产物：HDSH-debug-unsigned.hap（arm64 真机可装；未签名，需自行签后才能上真机）
+# 注意：只编 arm64 的 libnode；x64 模拟器要另跑 build-libnode-ohos.yml 的 x64
+
+name: build-hap-unsigned
+
+on:
+  workflow_dispatch:
+    inputs:
+      node_version:
+        description: "Node 版本（必须 22.x，soname 才是 .127）"
+        type: string
+        default: v22.23.2
+
+permissions:
+  contents: read
+
+env:
+  NODE_VER: ${{ github.event.inputs.node_version }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────────
+  # Job 1：libnode.so.127（arm64）
+  # ─────────────────────────────────────────────────────────────
+  libnode:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    env:
+      OHOS_ARCH: arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 清理预装工具，腾磁盘
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+/opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          df -h /
+
+      - name: 安装宿主编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3 unzip curl tar perl
+          gcc --version | head -1
+          python3 --version
+
+      - name: 校验 Node 版本（只允许 22.x）
+        run: |
+          case "$NODE_VER" in
+            v22.*) echo "OK: $NODE_VER" ;;
+            *) echo "::error::只支持 Node 22.x（ABI 127），收到 $NODE_VER"; exit 1 ;;
+          esac
+
+      - name: 下载并解包 OpenHarmony SDK
+        run: |
+          set -e
+          bash tools/node-runtime/fetch-ohos-sdk.sh
+
+          # 只留 native（llvm + sysroot）；删外层 tar、linux/windows zip 和其他组件
+          find "$HOME/ohos/sdk" -maxdepth 1 -mindepth 1 ! -name native -exec rm -rf {} +
+          rm -f "$HOME/ohos/ohos-sdk-"*.tar.gz
+          rm -rf "$HOME/ohos/linux" "$HOME/ohos/windows"
+
+          du -sh "$HOME/ohos/sdk"
+          df -h /
+
+      - name: 加 4GB swap
+        run: |
+          sudo fallocate -l 4G /swapfile
+sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: 交叉编译 libnode
+        run: |
+          set -e
+          bash tools/node-runtime/build-node-ohos.sh
+          tail -30 "$HOME/ohos/build-node-${OHOS_ARCH}.log" || true
+
+      - name: 校验产物
+        run: |
+          set -e
+          OUT="$HOME/ohos/node-${NODE_VER}/out/Release"
+          LIB="$OUT/libnode.so.127"
+          [ -f "$LIB" ] || { echo "::error::没有 libnode.so.127"; ls -la "$OUT"; exit 1; }
+          file "$LIB"
+          readelf -h "$LIB" | grep -E 'Class|Machine|Type'
+          readelf -d "$LIB" | grep -E 'SONAME|NEEDED' | head -10
+          readelf -d "$LIB" | grep -q 'libnode.so.127' || { echo "::error::SONAME 不对"; exit 1; }
+
+      - name: 收集产物
+        run: |
+          mkdir -p dist
+          cp -L "$HOME/ohos/node-${NODE_VER}/out/Release/libnode.so.127" dist/
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libnode-ohos-arm64
+path: dist/libnode.so.127
+          if-no-files-found: error
+          retention-days: 14
+
+  # ─────────────────────────────────────────────────────────────
+  # Job 2：完整 unsigned HAP
+  # ─────────────────────────────────────────────────────────────
+  hap:
+    needs: libnode
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    env:
+      CLT: ${{ github.workspace }}/../clt
+      SDK: ${{ github.workspace }}/../clt/command-line-tools/sdk
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 清理预装工具，腾磁盘
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/.ghcup || true
+          df -h /
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: 安装解包依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip curl tar file python3-pip
+python3 -m pip install --user --quiet py7zr json5
+          node -v
+          java -version
+
+      - name: 下载 DevEco Linux CLT（21 个 7z 分卷）
+        run: |
+          set -e
+          BASE="https://raw.githubusercontent.com/xiaobingtech/commandline-tools-linux-x64-26.0.0.821/main"
+          mkdir -p "$CLT"
+          cd "$CLT"
+          for n in $(seq 1 21); do
+            p=$(printf '%03d' "$n")
+            curl -fL --retry 3 --retry-delay 5 \
+              -o "clt.7z.$p" \
+              "$BASE/commandline-tools-linux-x64-26.0.0.821.7z.$p"
+          done
+          cat clt.7z.* > full.7z
+          rm -f clt.7z.*
+          ls -lh full.7z
+          df -h /
+
+      - name: 解开内层 zip
+        run: |
+          set -e
+          cd "$CLT"
+          python3 -m py7zr x full.7z
+          rm -f full.7z
+          ls -lh *.zip
+          df -h /
+
+      - name: 按需解包 CLT 组件（不展开完整 7.2GB）
+        run: |
+          set -e
+          cd "$CLT"
+          python3 - <<'PY'
+          import zipfile
+          z = zipfile.ZipFile('commandline-tools-linux-x64-26.0.0.821.zip')
+prefixes = [
+            'command-line-tools/bin/',
+            'command-line-tools/tool/',
+            'command-line-tools/hvigor/',
+            'command-line-tools/ohpm/',
+            'command-line-tools/sdk/default/sdk-pkg.json',
+            'command-line-tools/sdk/default/openharmony/ets/',
+            'command-line-tools/sdk/default/openharmony/js/',
+            'command-line-tools/sdk/default/openharmony/native/',
+            'command-line-tools/sdk/default/openharmony/toolchains/',
+            'command-line-tools/sdk/default/openharmony/previewer/',
+            'command-line-tools/sdk/default/hms/ets/',
+            'command-line-tools/sdk/default/hms/toolchains/',
+            'command-line-tools/sdk/default/hms/previewer/',
+          ]
+          names = [n for n in z.namelist()
+                   if any(n.startswith(p) for p in prefixes)
+                   or (n.startswith('command-line-tools/sdk/default/')
+                       and n.endswith('.json') and n.count('/') <= 4)]
+print('files', len(names))
+          z.extractall('.', members=names)
+          PY
+          rm -f commandline-tools-linux-x64-26.0.0.821.zip
+          du -sh "$CLT/command-line-tools"
+          df -h /
+
+      - name: 重建软链 + 补执行位（zip 解包会丢这两样）
+        run: |
+          set -e
+          cd "$CLT/command-line-tools"
+          python3 - <<'PY'
+          import os
+          roots = [
+            'sdk/default/openharmony/native/llvm',
+            'sdk/default/openharmony/native/build-tools',
+            'sdk/default/openharmony/toolchains',
+            'sdk/default/hms/toolchains',
+            'hvigor/bin', 'ohpm/bin', 'bin', 'tool/node/bin',
+          ]
+          n = 0
+          for r in roots:
+            for dp, dn, fns in os.walk(r):
+              for f in fns:
+                p = os.path.join(dp, f)
+                try:
+                  if os.path.islink(p) or os.path.getsize(p) > 300:
+                    continue
+                  b = open(p, 'rb').read()
+                except Exception:
+continue
+                if b'\x00' in b:
+                  continue
+                s = b.decode('utf8', 'ignore').strip()
+                if '\n' in s or not s or s.startswith('#') or s.startswith('{'):
+                  continue
+                t = os.path.normpath(os.path.join(dp, s))
+                if os.path.exists(t):
+                  os.remove(p)
+                  os.symlink(s, p)
+                  n += 1
+          print('converted symlinks:', n)
+          PY
+
+          chmod -R a+x \
+            bin tool/node/bin hvigor/bin ohpm/bin \
+            sdk/default/openharmony/native/llvm/bin \
+            sdk/default/openharmony/native/build-tools \
+            sdk/default/openharmony/toolchains \
+            sdk/default/hms/toolchains \
+            sdk/default/openharmony/ets/build-tools \
+            sdk/default/hms/ets/build-tools \
+            sdk/default/openharmony/js/build-tools \
+            sdk/default/openharmony/previewer \
+            sdk/default/hms/previewer 2>/dev/null || true
+"$CLT/command-line-tools/sdk/default/openharmony/native/llvm/bin/clang" --version | head -2
+          ls -l "$CLT/command-line-tools/sdk/default/openharmony/ets/build-tools/ets-loader/bin/ark/build/bin/es2abc"
+
+      - name: 修 SDK 组件标记（hms/native 软链 + uni-package.json）
+        run: |
+          set -e
+          SDK="$CLT/command-line-tools/sdk/default"
+
+          rm -rf "$SDK/hms/native"
+          mkdir -p "$SDK/hms/native"
+          for x in "$SDK/openharmony/native"/*; do
+            ln -s "$x" "$SDK/hms/native/$(basename "$x")"
+          done
+          cp "$SDK/openharmony/native/oh-uni-package.json" "$SDK/hms/native/"
+          [ -f "$SDK/openharmony/native/uni-package.json" ] && \
+            cp "$SDK/openharmony/native/uni-package.json" "$SDK/hms/native/" || true
+
+          cat > "$SDK/hms/native/uni-package.json" <<'EOF'
+          {
+            "apiVersion": "26",
+            "displayName": "Native",
+            "meta": { "metaVersion": "3.1.0" },
+            "path": "native",
+"platformVersion": "26.0.0",
+            "releaseType": "Release",
+            "version": "26.0.0.105"
+          }
+          EOF
+
+          for d in "$SDK/openharmony/previewer" "$SDK/hms/previewer"; do
+            mkdir -p "$d"
+            cat > "$d/oh-uni-package.json" <<'EOF'
+          {
+            "apiVersion": "26",
+            "displayName": "Previewer",
+            "meta": { "metaVersion": "3.0.2" },
+            "path": "previewer",
+            "platformVersion": "26.0.0",
+            "releaseType": "Release",
+            "version": "26.0.0.105"
+          }
+          EOF
+            cat > "$d/uni-package.json" <<'EOF'
+          {
+            "apiVersion": "26",
+            "displayName": "Previewer",
+            "meta": { "metaVersion": "3.0.2" },
+            "path": "previewer",
+            "platformVersion": "26.0.0",
+            "releaseType": "Release",
+            "version": "26.0.0.105"
+          }
+          EOF
+          done
+
+          ls -la "$SDK/hms/native" | head
+ls -la "$SDK/openharmony/previewer" | head
+          find "$SDK/openharmony/previewer" -name 'libsec_shared.so' -o -name 'libcjson.so' | head
+
+      - name: 同步 Node 头文件（CMake 必需）
+        run: |
+          set -e
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/node-headers.tar.gz" \
+            "https://nodejs.org/dist/${NODE_VER}/node-${NODE_VER}-headers.tar.gz"
+          tar -xzf "$RUNNER_TEMP/node-headers.tar.gz" -C "$RUNNER_TEMP"
+          SRC="$RUNNER_TEMP/node-${NODE_VER}/include/node"
+          DEST="entry/src/main/cpp/node-headers"
+          rm -rf "$DEST"
+          mkdir -p "$DEST/src" "$DEST/v8include" "$DEST/uvinclude"
+          cp -a "$SRC"/. "$DEST/src/"
+          cp -a "$SRC"/. "$DEST/v8include/"
+          cp -a "$SRC"/. "$DEST/uvinclude/"
+          test -f "$DEST/src/node.h"
+          test -f "$DEST/v8include/v8.h"
+          test -f "$DEST/uvinclude/uv.h"
+          du -sh "$DEST"
+
+      - name: 补 Host 入口 + koffi 源码 + 核心包
+        run: |
+          set -e
+          node tools/place-host-app.mjs
+node tools/fetch-koffi.mjs
+          node tools/pack-core.mjs --place-in-app
+          du -sh entry/src/main/resources/resfile/*.zip dist/core/work/* 2>/dev/null | tail -5
+
+          # CMake 里 flock 的源码路径仍写死 0.1.5-rc.2，做兼容链接让它也能编
+          CORE_VER=$(node -p "require('./hostcore/core-recipe.json').coreVersion")
+          ln -sfn "dsh-core-${CORE_VER}" "dist/core/work/dsh-core-0.1.5-rc.2"
+
+      - name: 放入 libnode.so.127
+        uses: actions/download-artifact@v4
+        with:
+          name: libnode-ohos-arm64
+          path: entry/libs/arm64-v8a
+
+      - name: 移除作者签名配置（出 unsigned HAP）
+        run: |
+          set -e
+          python3 - <<'PY'
+          import json, json5, pathlib
+          p = pathlib.Path('build-profile.json5')
+          d = json5.loads(p.read_text())
+          app = d.get('app', {})
+          app.pop('signingConfigs', None)
+          for prod in app.get('products', []):
+              prod.pop('signingConfig', None)
+          p.write_text(json.dumps(d, indent=2, ensure_ascii=False) + '\n')
+print('signingConfigs removed')
+          PY
+          grep -n "signingConfig" build-profile.json5 || true
+
+      - name: ohpm install
+        run: |
+          set -e
+          export PATH="$CLT/command-line-tools/bin:$CLT/command-line-tools/tool/node/bin:$PATH"
+          ohpm --version
+          ohpm install --all
+
+      - name: hvigorw assembleHap（unsigned）
+        run: |
+          set -e
+          export DEVECO_SDK_HOME="$CLT/command-line-tools/sdk"
+          export PATH="$JAVA_HOME/bin:$CLT/command-line-tools/bin:$CLT/command-line-tools/tool/node/bin:$PATH"
+          export LD_LIBRARY_PATH="$SDK/default/openharmony/previewer/common/bin:$SDK/default/hms/toolchains/lib:$SDK/default/openharmony/toolchains/lib"
+          export NODE_OPTIONS=--max-old-space-size=4096
+          chmod +x hvigorw
+          hvigorw assembleHap -p product=default -p buildMode=debug --no-daemon 2>&1 | tee "$RUNNER_TEMP/hvigor.log"
+          tail -30 "$RUNNER_TEMP/hvigor.log"
+
+      - name: 校验 HAP
+        run: |
+          set -e
+          HAP="entry/build/default/outputs/default/entry-default-unsigned.hap"
+          [ -f "$HAP" ] || { echo "::error::没有 unsigned HAP"; find entry/build -name '*.hap' -ls; exit 1; }
+          ls -lh "$HAP"
+          unzip -l "$HAP" | grep -E 'libnode|libdshhost|libkoffi|libsystem|resfile' | head -20
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: HDSH-debug-unsigned
+          path: entry/build/default/outputs/default/entry-default-unsigned.hap
+          if-no-files-found: error
+          retention-days: 14
